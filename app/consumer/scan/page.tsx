@@ -1,11 +1,16 @@
 "use client"
 
 import { useState, useRef, useEffect } from "react"
-import { QrCode, CheckCircle, AlertTriangle, XCircle, ArrowLeft, MessageCircle, Camera, Mic, MicOff, Volume2 } from "lucide-react"
+import { QrCode, CheckCircle, AlertTriangle, XCircle, ArrowLeft, MessageCircle, Camera, Mic, MicOff, Volume2, MessageSquare, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { QRScanner } from "@/components/qr-scanner"
+import { LanguageSelector, useLanguageSelection } from "@/components/language-selector"
+import { DrugExplanationCard, DrugExplanationCardSkeleton, DrugExplanationError } from "@/components/drug-explanation-card"
+import { QRScanForExplanation } from "@/components/qr-scan-for-explanation"
+import { ScanResultPreview } from "@/components/scan-result-preview"
+import { SupportedLanguageCode } from "@/lib/drug-explanation-frontend-types"
 import Link from "next/link"
 
 interface ChatMessage {
@@ -27,6 +32,21 @@ interface ScanResult {
   sideEffects: string[]
   dosage: string
 }
+
+// Convert ScanResult for consistency
+const convertScanResult = (scanResult: ScanResult) => ({
+  id: scanResult.id,
+  status: scanResult.status,
+  drugName: scanResult.drugName,
+  batchId: scanResult.batchId,
+  manufacturer: scanResult.manufacturer,
+  expiryDate: scanResult.expiryDate,
+  verificationScore: scanResult.verificationScore,
+  safetyRating: scanResult.safetyRating,
+  aiRecommendation: scanResult.aiRecommendation,
+  sideEffects: scanResult.sideEffects,
+  dosage: scanResult.dosage
+})
 
 // Mock scan results for consumers
 const mockConsumerResults: ScanResult[] = [
@@ -58,11 +78,123 @@ const mockConsumerResults: ScanResult[] = [
   },
 ]
 
+// Simple inline ExplainButton component
+function ExplainButton({ 
+  scanResult, 
+  selectedLanguage, 
+  onExplanationStart, 
+  onExplanationSuccess, 
+  onExplanationError, 
+  disabled 
+}: {
+  scanResult: any;
+  selectedLanguage: string;
+  onExplanationStart?: () => void;
+  onExplanationSuccess?: (explanation: any) => void;
+  onExplanationError?: (error: string, message: string) => void;
+  disabled?: boolean;
+}) {
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleClick = async () => {
+    if (!scanResult || isLoading || disabled) return;
+
+    setIsLoading(true);
+    onExplanationStart?.();
+
+    try {
+      const apiPayload = {
+        verificationData: {
+          drugName: scanResult.drugName,
+          status: scanResult.status === 'genuine' ? 'SAFE' : 
+                 scanResult.status === 'fake' ? 'NOT_SAFE' : 'SUSPICIOUS',
+          reasons: [scanResult.aiRecommendation || 'Scanned medication'],
+          batchId: scanResult.batchId,
+          manufacturer: scanResult.manufacturer,
+          expiryDate: scanResult.expiryDate,
+          trustScore: scanResult.verificationScore || 0
+        },
+        language: selectedLanguage || 'en'
+      };
+
+      const response = await fetch('/api/drug-explanation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(apiPayload)
+      });
+
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const result = await response.json();
+      if (result.status === 'error') throw new Error(result.message || 'API error');
+      onExplanationSuccess?.(result);
+    } catch (error) {
+      onExplanationError?.('api-error', error instanceof Error ? error.message : 'An error occurred');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <Button onClick={handleClick} disabled={disabled || !scanResult || isLoading} size="sm">
+      {isLoading ? (
+        <><Loader2 className="h-4 w-4 animate-spin mr-2" />Explaining...</>
+      ) : (
+        <><MessageSquare className="h-4 w-4 mr-2" />Explain This Scan</>
+      )}
+    </Button>
+  );
+}
+
+// Simple useExplanationRequest hook
+function useExplanationRequest() {
+  const [explanationState, setExplanationState] = useState({
+    isLoading: false,
+    error: null as string | null,
+    data: null as any,
+    requestedLanguage: null as SupportedLanguageCode | null
+  });
+
+  const handleExplanationStart = () => {
+    setExplanationState(prev => ({ ...prev, isLoading: true, error: null }));
+  };
+
+  const handleExplanationSuccess = (explanation: any, batchId?: string, language?: string) => {
+    setExplanationState({ 
+      isLoading: false, 
+      error: null, 
+      data: explanation,
+      requestedLanguage: (language as SupportedLanguageCode) || null
+    });
+  };
+
+  const handleExplanationError = (error: string, message: string) => {
+    setExplanationState(prev => ({ ...prev, isLoading: false, error: message }));
+  };
+
+  const getCachedExplanation = (batchId: string, language: string) => {
+    // Simple implementation - in a real app this would check localStorage or a cache
+    return null;
+  };
+
+  const clearExplanation = () => {
+    setExplanationState({ isLoading: false, error: null, data: null, requestedLanguage: null });
+  };
+
+  return {
+    explanationState,
+    handleExplanationStart,
+    handleExplanationSuccess,
+    handleExplanationError,
+    getCachedExplanation,
+    clearExplanation
+  };
+}
+
 export default function ConsumerScanPage() {
 
   const [isScanning, setIsScanning] = useState(false)
 
-  const [scanResult, setScanResult] = useState<ScanResult | null > (null)
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null)
   
   const [showAIChat, setShowAIChat] = useState(false)
 
@@ -76,11 +208,25 @@ export default function ConsumerScanPage() {
 
   const [isListening, setIsListening] = useState(false)
   
+  const [qrScanError, setQrScanError] = useState<string | null>(null)
+  const [showLegacyScanner, setShowLegacyScanner] = useState(false)
+  
   const [userProfile, setUserProfile] = useState({
     weight: "",
     age: "",
     currentMedications: [] as string[]
   })
+
+  // Drug Explanation State
+  const { selectedLanguage, onLanguageChange } = useLanguageSelection('en')
+  const {
+    explanationState,
+    handleExplanationStart,
+    handleExplanationSuccess,
+    handleExplanationError,
+    getCachedExplanation,
+    clearExplanation
+  } = useExplanationRequest()
 
   const videoRef = useRef<HTMLVideoElement>(null)
   
@@ -184,7 +330,21 @@ export default function ConsumerScanPage() {
   // Handle QR scanner errors
   const handleQRError = (error: string) => {
     console.error('QR Scanner error:', error)
-    // You could show an error message to the user here
+    setQrScanError(error)
+  }
+
+  // Handle QR scan results from new component
+  const handleQRScanResult = (result: ScanResult) => {
+    console.log('QR scan result:', result)
+    setScanResult(result)
+    setLastScanTime(new Date().toLocaleTimeString())
+    setQrScanError(null)
+  }
+
+  // Handle QR scan errors from new component  
+  const handleQRScanError = (error: string) => {
+    console.error('QR scan error:', error)
+    setQrScanError(error)
   }
 
   // Process QR code data and return a scan result
@@ -221,7 +381,7 @@ export default function ConsumerScanPage() {
     const randomResult = mockConsumerResults[Math.floor(Math.random() * mockConsumerResults.length)]
 
     return {
-      ...randomResult,
+      ...convertScanResult(randomResult),
       id: `scan-${Date.now()}`,
       // Add the scanned QR data for reference
       batchId: qrData.length > 20 ? qrData.substring(0, 20) + '...' : qrData
@@ -327,6 +487,36 @@ export default function ConsumerScanPage() {
     }
   }
 
+  // Drug Explanation Handlers
+  const handleExplanationRequest = () => {
+    if (!scanResult) return
+    
+    // Check cache first
+    const cached = getCachedExplanation(scanResult.id, selectedLanguage)
+    if (cached) {
+      handleExplanationSuccess(cached, scanResult.id, selectedLanguage)
+      return
+    }
+    
+    // Clear previous explanation when starting new request
+    clearExplanation()
+  }
+
+  const onExplanationSuccess = (explanation: any) => {
+    if (scanResult) {
+      handleExplanationSuccess(explanation, scanResult.id, selectedLanguage)
+    }
+  }
+
+  const onExplanationError = (error: string, message: string) => {
+    handleExplanationError(error, message)
+  }
+
+  // Clear explanation when scan result changes
+  useEffect(() => {
+    clearExplanation()
+  }, [scanResult?.id, clearExplanation])
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-cyan-50">
       <div className="container mx-auto px-4 py-8">
@@ -341,10 +531,30 @@ export default function ConsumerScanPage() {
               <p className="text-slate-600">Scan to check authenticity and get AI guidance</p>
             </div>
           </div>
-          <Button variant="outline" onClick={() => setShowAIChat(!showAIChat)} className="cursor-pointer border-primary/20 hover:border-primary/40 hover:bg-primary/5">
-            <MessageCircle className="w-4 h-4 mr-2 text-primary" />
-            AI Assistant
-          </Button>
+          <div className="flex items-center space-x-3">
+            {/* Language Selector */}
+            <LanguageSelector 
+              selectedLanguage={selectedLanguage}
+              onLanguageChange={onLanguageChange}
+              disabled={explanationState.isLoading}
+              className="hidden sm:block"
+            />
+            
+            {/* Explain Button */}
+            <ExplainButton
+              scanResult={scanResult}
+              selectedLanguage={selectedLanguage}
+              onExplanationStart={handleExplanationRequest}
+              onExplanationSuccess={onExplanationSuccess}
+              onExplanationError={onExplanationError}
+              disabled={!scanResult || explanationState.isLoading}
+            />
+            
+            <Button variant="outline" onClick={() => setShowAIChat(!showAIChat)} className="cursor-pointer border-primary/20 hover:border-primary/40 hover:bg-primary/5">
+              <MessageCircle className="w-4 h-4 mr-2 text-primary" />
+              AI Assistant
+            </Button>
+          </div>
         </div>
 
         <div className="grid lg:grid-cols-3 gap-8">
@@ -359,94 +569,192 @@ export default function ConsumerScanPage() {
               </CardHeader>
 
               <CardContent className="space-y-6">
-                {/* QR Scanner */}
-                <div className="flex justify-center">
-                  <QRScanner
-                    onScan={handleQRScan}
-                    onError={handleQRError}
-                    width={400}
-                    height={300}
-                    facingMode="environment"
-                    autoStart={true}
-                    className="mx-auto"
-                  />
+                {/* QR Scanner Options */}
+                <div className="flex flex-col sm:flex-row gap-4 justify-center items-center">
+                  <Button
+                    onClick={() => setShowLegacyScanner(false)}
+                    variant={!showLegacyScanner ? "default" : "outline"}
+                    className="w-full sm:w-auto"
+                  >
+                    Enhanced QR Scanner
+                  </Button>
+                  <Button
+                    onClick={() => setShowLegacyScanner(true)}
+                    variant={showLegacyScanner ? "default" : "outline"}
+                    className="w-full sm:w-auto"
+                  >
+                    Legacy Scanner
+                  </Button>
                 </div>
 
-                {/* Scan Controls */}
-                <div className="flex justify-center">
-                  {!isScanning ? (
-                    <Button
-                      onClick={() => setIsScanning(true)}
-                      className="px-8 py-3 bg-gradient-to-r from-primary to-accent hover:from-primary/90 hover:to-accent/90 text-white cursor-pointer shadow-lg hover:shadow-xl transition-all duration-300"
-                    >
-                      <Camera className="w-5 h-5 mr-2" />
-                      Scan Medication
-                    </Button>
-                  ) : (
-                    <Button onClick={stopScan} variant="outline" className="px-8 py-3 cursor-pointer bg-transparent border-primary/20 hover:border-primary/40 hover:bg-primary/5">
-                      Stop Scan
-                    </Button>
-                  )}
-                </div>
+                {/* Enhanced QR Scanner */}
+                {!showLegacyScanner ? (
+                  <div className="space-y-4">
+                    <QRScanForExplanation
+                      onScanResult={handleQRScanResult}
+                      onScanError={handleQRScanError}
+                      disabled={explanationState.isLoading}
+                      className="max-w-md mx-auto"
+                    />
+                    
+                    {/* Error display */}
+                    {qrScanError && (
+                      <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-center">
+                        <p className="text-red-600 text-sm">
+                          <strong>Error:</strong> {qrScanError}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  /* Legacy QR Scanner */
+                  <div className="space-y-4">
+                    <div className="flex justify-center">
+                      <QRScanner
+                        onScan={handleQRScan}
+                        onError={handleQRError}
+                        width={400}
+                        height={300}
+                        facingMode="environment"
+                        autoStart={true}
+                        className="mx-auto"
+                      />
+                    </div>
+
+                    {/* Scan Controls */}
+                    <div className="flex justify-center">
+                      {!isScanning ? (
+                        <Button
+                          onClick={() => setIsScanning(true)}
+                          className="px-8 py-3 bg-gradient-to-r from-primary to-accent hover:from-primary/90 hover:to-accent/90 text-white cursor-pointer shadow-lg hover:shadow-xl transition-all duration-300"
+                        >
+                          <Camera className="w-5 h-5 mr-2" />
+                          Scan Medication
+                        </Button>
+                      ) : (
+                        <Button onClick={stopScan} variant="outline" className="px-8 py-3 cursor-pointer bg-transparent border-primary/20 hover:border-primary/40 hover:bg-primary/5">
+                          Stop Scan
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {/* Scan Result */}
                 {scanResult && (
-                  <Card className="border-2 border-primary/10 shadow-lg backdrop-blur-sm hover:shadow-xl transition-all duration-300 hover:-translate-y-1">
-                    <CardHeader>
-                      <CardTitle className="flex items-center justify-between font-bold">
-                        <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">Verification Result</span>
-                        <Badge className={`${getStatusColor(scanResult.status)} border-primary/20`}>
-                          {getStatusIcon(scanResult.status)}
-                          <span className="ml-2 capitalize">{scanResult.status}</span>
-                        </Badge>
-                      </CardTitle>
-                    </CardHeader>
+                  <div className="space-y-6">
+                    {/* Enhanced Scan Result Preview */}
+                    <ScanResultPreview 
+                      scanResult={scanResult}
+                      className="max-w-2xl mx-auto"
+                    />
 
-                    <CardContent className="space-y-6">
-                      {/* Drug Information */}
-                      <div className="space-y-4">
-                        <div>
-                          <h3 className="font-semibold text-lg text-slate-900">{scanResult.drugName}</h3>
-                          <p className="text-slate-600">Manufactured by {scanResult.manufacturer}</p>
-                        </div>
+                    {/* Legacy Scan Result Display */}
+                    <Card className="border-2 border-primary/10 shadow-lg backdrop-blur-sm hover:shadow-xl transition-all duration-300 hover:-translate-y-1">
+                      <CardHeader>
+                        <CardTitle className="flex items-center justify-between font-bold">
+                          <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">Detailed Verification Result</span>
+                          <Badge className={`${getStatusColor(scanResult.status)} border-primary/20`}>
+                            {getStatusIcon(scanResult.status)}
+                            <span className="ml-2 capitalize">{scanResult.status}</span>
+                          </Badge>
+                        </CardTitle>
+                      </CardHeader>
 
-                        <div className="grid grid-cols-2 gap-4 text-sm">
+                      <CardContent className="space-y-6">
+                        {/* Drug Information */}
+                        <div className="space-y-4">
                           <div>
-                            <span className="text-slate-600">Batch ID:</span>
-                            <p className="font-medium">{scanResult.batchId}</p>
+                            <h3 className="font-semibold text-lg text-slate-900">{scanResult.drugName}</h3>
+                            <p className="text-slate-600">Manufactured by {scanResult.manufacturer}</p>
                           </div>
-                          <div>
-                            <span className="text-slate-600">Expires:</span>
-                            <p className="font-medium">{scanResult.expiryDate}</p>
+
+                          <div className="grid grid-cols-2 gap-4 text-sm">
+                            <div>
+                              <span className="text-slate-600">Batch ID:</span>
+                              <p className="font-medium">{scanResult.batchId}</p>
+                            </div>
+                            <div>
+                              <span className="text-slate-600">Expires:</span>
+                              <p className="font-medium">{scanResult.expiryDate}</p>
+                            </div>
                           </div>
                         </div>
-                      </div>
 
-                      {/* Safety Information */}
-                      <div className={`p-4 rounded-lg border-2 border-primary/10 bg-gradient-to-r from-primary/5 to-accent/5 ${getStatusColor(scanResult.status)}`}>
-                        <h4 className="font-bold mb-2">Safety Assessment</h4>
-                        <p className="text-sm">{scanResult.safetyRating}</p>
-                      </div>
-
-                      {/* Dosage Information */}
-                      <div className="space-y-2">
-                        <h4 className="font-bold text-slate-900">Recommended Dosage</h4>
-                        <p className="text-sm text-slate-600">{scanResult.dosage}</p>
-                      </div>
-
-                      {/* Side Effects */}
-                      <div className="space-y-2">
-                        <h4 className="font-bold text-slate-900">Possible Side Effects</h4>
-                        <div className="flex flex-wrap gap-2">
-                          {scanResult.sideEffects.map((effect: string, index: number) => (
-                            <Badge key={index} variant="outline" className="text-xs border-primary/20 hover:border-primary/40 hover:bg-primary/5">
-                              {effect}
-                            </Badge>
-                          ))}
+                        {/* Safety Information */}
+                        <div className={`p-4 rounded-lg border-2 border-primary/10 bg-gradient-to-r from-primary/5 to-accent/5 ${getStatusColor(scanResult.status)}`}>
+                          <h4 className="font-bold mb-2">Safety Assessment</h4>
+                          <p className="text-sm">{scanResult.safetyRating}</p>
                         </div>
-                      </div>
-                    </CardContent>
-                  </Card>
+
+                        {/* Dosage Information */}
+                        <div className="space-y-2">
+                          <h4 className="font-bold text-slate-900">Recommended Dosage</h4>
+                          <p className="text-sm text-slate-600">{scanResult.dosage}</p>
+                        </div>
+
+                        {/* Side Effects */}
+                        <div className="space-y-2">
+                          <h4 className="font-bold text-slate-900">Possible Side Effects</h4>
+                          <div className="flex flex-wrap gap-2">
+                            {scanResult.sideEffects.map((effect: string, index: number) => (
+                              <Badge key={index} variant="outline" className="text-xs border-primary/20 hover:border-primary/40 hover:bg-primary/5">
+                                {effect}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Last scan time */}
+                        {lastScanTime && (
+                          <div className="text-xs text-slate-500 text-center">
+                            Last scanned at {lastScanTime}
+                          </div>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </div>
+                )}
+
+                {/* Mobile Language Selector */}
+                <div className="block sm:hidden">
+                  <LanguageSelector 
+                    selectedLanguage={selectedLanguage}
+                    onLanguageChange={onLanguageChange}
+                    disabled={explanationState.isLoading}
+                    className="w-full"
+                  />
+                </div>
+
+                {/* Drug Explanation Card */}
+                {scanResult && (
+                  <div className="space-y-4">
+                    {explanationState.isLoading && (
+                      <DrugExplanationCardSkeleton />
+                    )}
+
+                    {explanationState.error && (
+                      <DrugExplanationError 
+                        error={explanationState.error}
+                        onRetry={() => {
+                          if (scanResult) {
+                            clearExplanation()
+                            handleExplanationRequest()
+                          }
+                        }}
+                      />
+                    )}
+
+                    {explanationState.data && (
+                      <DrugExplanationCard
+                        explanation={explanationState.data}
+                        requestedLanguage={explanationState.requestedLanguage || selectedLanguage}
+                        scanResult={scanResult}
+                        onDismiss={clearExplanation}
+                        showRawData={true}
+                      />
+                    )}
+                  </div>
                 )}
               </CardContent>
             </Card>
